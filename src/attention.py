@@ -1,6 +1,8 @@
 import functools
 import torch
 from einops import rearrange, repeat, einsum
+import src.model_management as model_management
+import src.ops as ops
 
 
 def get_attn_precision(attn_precision, current_dtype):
@@ -122,5 +124,86 @@ def attention_basic(
   return out
 
 
+SDP_BATCH_LIMIT = 2**15
+
+
+@wrap_attn
+def attention_pytorch(
+  q,
+  k,
+  v,
+  heads,
+  mask=None,
+  attn_precision=None,
+  skip_reshape=False,
+  skip_output_reshape=False,
+  **kwargs,
+):
+  if skip_reshape:
+    b, _, _, dim_head = q.shape
+  else:
+    b, _, dim_head = q.shape
+    dim_head //= heads
+    q, k, v = map(
+      lambda t: t.view(b, -1, heads, dim_head).transpose(1, 2),
+      (q, k, v),
+    )
+
+  if mask is not None:
+    # add a batch dimension if there isn't already one
+    if mask.ndim == 2:
+      mask = mask.unsqueeze(0)
+    # add a heads dimension if there isn't already one
+    if mask.ndim == 3:
+      mask = mask.unsqueeze(1)
+
+  if SDP_BATCH_LIMIT >= b:
+    out = ops.scaled_dot_product_attention(
+      q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False
+    )
+    if not skip_output_reshape:
+      out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
+  else:
+    out = torch.empty(
+      (b, q.shape[2], heads * dim_head), dtype=q.dtype, layout=q.layout, device=q.device
+    )
+    for i in range(0, b, SDP_BATCH_LIMIT):
+      m = mask
+      if mask is not None:
+        if mask.shape[0] > 1:
+          m = mask[i : i + SDP_BATCH_LIMIT]
+
+      out[i : i + SDP_BATCH_LIMIT] = (
+        ops.scaled_dot_product_attention(
+          q[i : i + SDP_BATCH_LIMIT],
+          k[i : i + SDP_BATCH_LIMIT],
+          v[i : i + SDP_BATCH_LIMIT],
+          attn_mask=m,
+          dropout_p=0.0,
+          is_causal=False,
+        )
+        .transpose(1, 2)
+        .reshape(-1, q.shape[2], heads * dim_head)
+      )
+  return out
+
+
 # TODO: switch to flash_attn or sage or ptch
 optimized_attention = attention_basic
+optimized_attention_masked = optimized_attention
+
+
+def optimized_attention_for_device(device, mask=False, small_input=False):
+  if small_input:
+    if model_management.pytorch_attention_enabled():
+      return attention_pytorch  # TODO: need to confirm but this is probably slightly faster for small inputs in all cases
+    else:
+      return attention_basic
+
+  # if device == torch.device("cpu"):
+  #   return attention_sub_quad
+
+  if mask:
+    return optimized_attention_masked
+
+  return optimized_attention

@@ -3,6 +3,7 @@ import src.model_management as model_management
 import contextlib
 import src.rsnorm as rsnorm
 from src.quant_ops import QuantizedTensor
+import src.float as _float
 
 
 def run_every_op():
@@ -10,6 +11,10 @@ def run_every_op():
     return
 
   model_management.throw_exception_if_processing_interrupted()
+
+
+def scaled_dot_product_attention(q, k, v, *args, **kwargs):
+  return torch.nn.functional.scaled_dot_product_attention(q, k, v, *args, **kwargs)
 
 
 def cast_bias_weight(
@@ -453,3 +458,130 @@ def pick_operations(
     return disable_weight_init
 
   return manual_cast
+
+
+def fp8_linear(self, input):
+  """
+  Legacy FP8 linear function for backward compatibility.
+  Uses QuantizedTensor subclass for dispatch.
+  """
+  dtype = self.weight.dtype
+  if dtype not in [torch.float8_e4m3fn]:
+    return None
+
+  input_dtype = input.dtype
+
+  if input.ndim == 3 or input.ndim == 2:
+    w, bias, offload_stream = cast_bias_weight(
+      self, input, dtype=dtype, bias_dtype=input_dtype, offloadable=True
+    )
+
+    scale_weight = self.scale_weight
+    scale_input = self.scale_input
+    if scale_weight is None:
+      scale_weight = torch.ones((), device=input.device, dtype=torch.float32)
+    else:
+      scale_weight = scale_weight.to(input.device)
+
+    if scale_input is None:
+      scale_input = torch.ones((), device=input.device, dtype=torch.float32)
+      input = torch.clamp(input, min=-448, max=448, out=input)
+      layout_params_weight = {"scale": scale_input, "orig_dtype": input_dtype}
+      quantized_input = QuantizedTensor(
+        input.to(dtype).contiguous(), "TensorCoreFP8Layout", layout_params_weight
+      )
+    else:
+      scale_input = scale_input.to(input.device)
+      quantized_input = QuantizedTensor.from_float(
+        input, "TensorCoreFP8Layout", scale=scale_input, dtype=dtype
+      )
+
+    # Wrap weight in QuantizedTensor - this enables unified dispatch
+    # Call F.linear - __torch_dispatch__ routes to fp8_linear handler in quant_ops.py!
+    layout_params_weight = {"scale": scale_weight, "orig_dtype": input_dtype}
+    quantized_weight = QuantizedTensor(w, "TensorCoreFP8Layout", layout_params_weight)
+    o = torch.nn.functional.linear(quantized_input, quantized_weight, bias)
+
+    uncast_bias_weight(self, w, bias, offload_stream)
+    return o
+
+  return None
+
+
+def scaled_fp8_ops(fp8_matrix_mult=False, scale_input=False, override_dtype=None):
+  print(
+    "Using scaled fp8: fp8 matrix mult: {}, scale input: {}".format(
+      fp8_matrix_mult, scale_input
+    )
+  )
+
+  class scaled_fp8_op(manual_cast):
+    class Linear(manual_cast.Linear):
+      def __init__(self, *args, **kwargs):
+        if override_dtype is not None:
+          kwargs["dtype"] = override_dtype
+        super().__init__(*args, **kwargs)
+
+      def reset_parameters(self):
+        if not hasattr(self, "scale_weight"):
+          self.scale_weight = torch.nn.parameter.Parameter(
+            data=torch.ones((), device=self.weight.device, dtype=torch.float32),
+            requires_grad=False,
+          )
+
+        if not scale_input:
+          self.scale_input = None
+
+        if not hasattr(self, "scale_input"):
+          self.scale_input = torch.nn.parameter.Parameter(
+            data=torch.ones((), device=self.weight.device, dtype=torch.float32),
+            requires_grad=False,
+          )
+        return None
+
+      def forward_comfy_cast_weights(self, input):
+        if fp8_matrix_mult:
+          out = fp8_linear(self, input)
+          if out is not None:
+            return out
+
+        weight, bias, offload_stream = cast_bias_weight(self, input, offloadable=True)
+
+        if weight.numel() < input.numel():  # TODO: optimize
+          x = torch.nn.functional.linear(
+            input,
+            weight * self.scale_weight.to(device=weight.device, dtype=weight.dtype),
+            bias,
+          )
+        else:
+          x = torch.nn.functional.linear(
+            input * self.scale_weight.to(device=weight.device, dtype=weight.dtype),
+            weight,
+            bias,
+          )
+        uncast_bias_weight(self, weight, bias, offload_stream)
+        return x
+
+      def convert_weight(self, weight, inplace=False, **kwargs):
+        if inplace:
+          weight *= self.scale_weight.to(device=weight.device, dtype=weight.dtype)
+          return weight
+        else:
+          return weight * self.scale_weight.to(device=weight.device, dtype=weight.dtype)
+
+      def set_weight(
+        self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs
+      ):
+        weight = _float.stochastic_rounding(
+          weight / self.scale_weight.to(device=weight.device, dtype=weight.dtype),
+          self.weight.dtype,
+          seed=seed,
+        )
+        if return_weight:
+          return weight
+        if inplace_update:
+          self.weight.data.copy_(weight)
+        else:
+          self.weight = torch.nn.Parameter(weight, requires_grad=False)
+
+  return scaled_fp8_op

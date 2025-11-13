@@ -80,3 +80,7 @@ def dtype_size(dtype):
 def pytorch_attention_flash_attention():
   # TODO: implement this
   return False
+
+def pytorch_attention_enabled():
+  # TODO: implement this we want it
+  return True
