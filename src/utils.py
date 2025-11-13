@@ -2,6 +2,7 @@ import math
 import torch
 import numpy as np
 from PIL import Image
+import safetensors
 
 
 def repeat_to_batch_size(tensor, batch_size, dim=0):
@@ -106,3 +107,92 @@ def common_upscale(samples, width, height, upscale_method, crop):
 
   out = out.reshape((orig_shape[0], -1, orig_shape[1]) + (height, width))
   return out.movedim(2, 1).reshape(orig_shape[:-2] + (height, width))
+
+
+def load_torch_file(ckpt, safe_load=False, device=None, return_metadata=False):
+  if device is None:
+    device = torch.device("cpu")
+  metadata = None
+  if ckpt.lower().endswith(".safetensors") or ckpt.lower().endswith(".sft"):
+    try:
+      with safetensors.safe_open(ckpt, framework="pt", device=device.type) as f:
+        sd = {}
+        for k in f.keys():
+          tensor = f.get_tensor(k)
+          sd[k] = tensor
+        if return_metadata:
+          metadata = f.metadata()
+    except Exception as e:
+      if len(e.args) > 0:
+        message = e.args[0]
+        if "HeaderTooLarge" in message:
+          raise ValueError(
+            "{}\n\nFile path: {}\n\nThe safetensors file is corrupt or invalid. Make sure this is actually a safetensors file and not a ckpt or pt or other filetype.".format(
+              message, ckpt
+            )
+          )
+        if "MetadataIncompleteBuffer" in message:
+          raise ValueError(
+            "{}\n\nFile path: {}\n\nThe safetensors file is corrupt/incomplete. Check the file size and make sure you have copied/downloaded it correctly.".format(
+              message, ckpt
+            )
+          )
+      raise e
+  else:
+    torch_args = {}
+    pl_sd = torch.load(ckpt, map_location=device, weights_only=True, **torch_args)
+    if "state_dict" in pl_sd:
+      sd = pl_sd["state_dict"]
+    else:
+      if len(pl_sd) == 1:
+        key = list(pl_sd.keys())[0]
+        sd = pl_sd[key]
+        if not isinstance(sd, dict):
+          sd = pl_sd
+      else:
+        sd = pl_sd
+  return (sd, metadata) if return_metadata else sd
+
+
+def calculate_parameters(sd, prefix=""):
+  params = 0
+  for k in sd.keys():
+    if k.startswith(prefix):
+      w = sd[k]
+      params += w.nelement()
+  return params
+
+
+def weight_dtype(sd, prefix=""):
+  dtypes = {}
+  for k in sd.keys():
+    if k.startswith(prefix):
+      w = sd[k]
+      dtypes[w.dtype] = dtypes.get(w.dtype, 0) + w.numel()
+
+  if len(dtypes) == 0:
+    return None
+
+  return max(dtypes, key=dtypes.get)
+
+
+def copy_to_param(obj, attr, value):
+  # inplace update tensor instead of replacing it
+  attrs = attr.split(".")
+  for name in attrs[:-1]:
+    obj = getattr(obj, name)
+  prev = getattr(obj, attrs[-1])
+  prev.data.copy_(value)
+
+
+def set_attr(obj, attr, value):
+  attrs = attr.split(".")
+  for name in attrs[:-1]:
+    obj = getattr(obj, name)
+  prev = getattr(obj, attrs[-1])
+  setattr(obj, attrs[-1], value)
+  return prev
+
+
+def set_attr_param(obj, attr, value):
+  return set_attr(obj, attr, torch.nn.Parameter(value, requires_grad=False))
