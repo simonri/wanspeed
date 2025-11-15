@@ -6,9 +6,11 @@ import src.model_management as model_management
 import src.utils as utils
 import src.model_patcher as model_patcher
 import src.model_detection as model_detection
-import src.text_encoders as text_encoders
 import src.hooks as hooks
 
+import src.text_encoders.sd3_clip as sd3_clip
+import src.text_encoders.long_clipl as long_clipl
+import src.text_encoders.wan as wan
 
 class TEModel(Enum):
   CLIP_L = 1
@@ -67,7 +69,7 @@ def t5xxl_detect(clip_data):
 
   for sd in clip_data:
     if weight_name in sd or weight_name_old in sd:
-      return text_encoders.sd3_clip.t5_xxl_detect(sd)
+      return sd3_clip.t5_xxl_detect(sd)
 
   return {}
 
@@ -324,12 +326,16 @@ def load_text_encoder_state_dicts(
   tokenizer_data = {}
   clip_target = EmptyClass()
   clip_target.params = {}
+
+  print(len(clip_data))
+  print(clip_type)
+
   if len(clip_data) == 1:
     te_model = detect_te_model(clip_data[0])
     if te_model == TEModel.T5_XXL:
       if clip_type == CLIPType.WAN:
-        clip_target.clip = text_encoders.wan.te(**t5xxl_detect(clip_data))
-        clip_target.tokenizer = text_encoders.wan.WanT5Tokenizer
+        clip_target.clip = wan.te(**t5xxl_detect(clip_data))
+        clip_target.tokenizer = wan.WanT5Tokenizer
         tokenizer_data["spiece_model"] = clip_data[0].get("spiece_model", None)
       else:
         print("Unsupported CLIP type: ", clip_type)
@@ -341,7 +347,7 @@ def load_text_encoder_state_dicts(
   parameters = 0
   for c in clip_data:
     parameters += utils.calculate_parameters(c)
-    tokenizer_data, model_options = text_encoders.long_clipl.model_options_long_clip(
+    tokenizer_data, model_options = long_clipl.model_options_long_clip(
       c, tokenizer_data, model_options
     )
 

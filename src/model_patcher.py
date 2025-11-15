@@ -11,6 +11,7 @@ import src.hooks as hooks
 import src.lora as lora
 import src.float as _float
 from src.patcher_extension import CallbacksMP, WrappersMP, PatcherInjection
+from src.hooks import create_transformer_options_from_hooks
 
 import collections
 
@@ -1352,13 +1353,13 @@ class ModelPatcher:
     if self.current_hooks == hooks and (
       not force_apply or (not self.is_clip and hooks is None)
     ):
-      return hooks.create_transformer_options_from_hooks(
+      return create_transformer_options_from_hooks(
         self, hooks, transformer_options
       )
     self.patch_hooks(hooks=hooks)
     for callback in self.get_all_callbacks(CallbacksMP.ON_APPLY_HOOKS):
       callback(self, hooks)
-    return hooks.create_transformer_options_from_hooks(self, hooks, transformer_options)
+    return create_transformer_options_from_hooks(self, hooks, transformer_options)
 
   def patch_hooks(self, hooks: hooks.HookGroup):
     with self.use_ejected():

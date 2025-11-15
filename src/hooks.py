@@ -7,7 +7,6 @@ import numpy as np
 import itertools
 import logging
 
-import src.model_management as model_management
 import src.patcher_extension as patcher_extension
 import src.lora as lora
 import src.modules.helpers as helpers

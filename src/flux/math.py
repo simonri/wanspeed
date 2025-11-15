@@ -1,12 +1,12 @@
 import torch
 from torch import Tensor
 from einops import rearrange
-from src.model_management import is_device_mps, is_intel_xpu, is_directml_enabled
+from src.model_management import is_device_mps
 
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
   assert dim % 2 == 0
-  if is_device_mps(pos.device) or is_intel_xpu() or is_directml_enabled():
+  if is_device_mps(pos.device):
     device = torch.device("cpu")
 
   scale = torch.linspace(

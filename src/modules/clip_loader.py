@@ -3,7 +3,8 @@ import src.sd as sd
 
 
 class CLIPLoader:
-  def load_clip(self, clip_path: str, type="stable_diffusion", device="default"):
+  # note only wan is supported for now
+  def load_clip(self, clip_path: str, type="wan", device="default"):
     clip_type = getattr(sd.CLIPType, type.upper(), sd.CLIPType.STABLE_DIFFUSION)
 
     model_options = {}

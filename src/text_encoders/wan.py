@@ -1,6 +1,7 @@
 import src.sd1_clip as sd1_clip
 import os
-import src.text_encoders as text_encoders
+import src.text_encoders.t5 as t5
+from src.text_encoders.spiece_tokenizer import SPieceTokenizer
 
 
 class UMT5XXlModel(sd1_clip.SDClipModel):
@@ -17,7 +18,7 @@ class UMT5XXlModel(sd1_clip.SDClipModel):
       textmodel_json_config=textmodel_json_config,
       dtype=dtype,
       special_tokens={"end": 1, "pad": 0},
-      model_class=text_encoders.t5.T5,
+      model_class=t5.T5,
       enable_attention_masks=True,
       zero_out_masked=True,
       model_options=model_options,
@@ -47,3 +48,34 @@ def te(dtype_t5=None, t5xxl_scaled_fp8=None):
       super().__init__(device=device, dtype=dtype, model_options=model_options)
 
   return WanTEModel
+
+
+class UMT5XXlTokenizer(sd1_clip.SDTokenizer):
+  def __init__(self, embedding_directory=None, tokenizer_data={}):
+    tokenizer = tokenizer_data.get("spiece_model", None)
+    super().__init__(
+      tokenizer,
+      pad_with_end=False,
+      embedding_size=4096,
+      embedding_key="umt5xxl",
+      tokenizer_class=SPieceTokenizer,
+      has_start_token=False,
+      pad_to_max_length=False,
+      max_length=99999999,
+      min_length=512,
+      pad_token=0,
+      tokenizer_data=tokenizer_data,
+    )
+
+  def state_dict(self):
+    return {"spiece_model": self.tokenizer.serialize_model()}
+
+
+class WanT5Tokenizer(sd1_clip.SD1Tokenizer):
+  def __init__(self, embedding_directory=None, tokenizer_data={}):
+    super().__init__(
+      embedding_directory=embedding_directory,
+      tokenizer_data=tokenizer_data,
+      clip_name="umt5xxl",
+      tokenizer=UMT5XXlTokenizer,
+    )
