@@ -196,3 +196,133 @@ def set_attr(obj, attr, value):
 
 def set_attr_param(obj, attr, value):
   return set_attr(obj, attr, torch.nn.Parameter(value, requires_grad=False))
+
+
+def state_dict_prefix_replace(state_dict, replace_prefix, filter_keys=False):
+  if filter_keys:
+    out = {}
+  else:
+    out = state_dict
+  for rp in replace_prefix:
+    replace = list(
+      map(
+        lambda a: (a, "{}{}".format(replace_prefix[rp], a[len(rp) :])),
+        filter(lambda a: a.startswith(rp), state_dict.keys()),
+      )
+    )
+    for x in replace:
+      w = state_dict.pop(x[0])
+      out[x[1]] = w
+  return out
+
+
+def swap_scale_shift(weight):
+  shift, scale = weight.chunk(2, dim=0)
+  new_weight = torch.cat([scale, shift], dim=0)
+  return new_weight
+
+
+MMDIT_MAP_BASIC = {
+  ("context_embedder.bias", "context_embedder.bias"),
+  ("context_embedder.weight", "context_embedder.weight"),
+  ("t_embedder.mlp.0.bias", "time_text_embed.timestep_embedder.linear_1.bias"),
+  ("t_embedder.mlp.0.weight", "time_text_embed.timestep_embedder.linear_1.weight"),
+  ("t_embedder.mlp.2.bias", "time_text_embed.timestep_embedder.linear_2.bias"),
+  ("t_embedder.mlp.2.weight", "time_text_embed.timestep_embedder.linear_2.weight"),
+  ("x_embedder.proj.bias", "pos_embed.proj.bias"),
+  ("x_embedder.proj.weight", "pos_embed.proj.weight"),
+  ("y_embedder.mlp.0.bias", "time_text_embed.text_embedder.linear_1.bias"),
+  ("y_embedder.mlp.0.weight", "time_text_embed.text_embedder.linear_1.weight"),
+  ("y_embedder.mlp.2.bias", "time_text_embed.text_embedder.linear_2.bias"),
+  ("y_embedder.mlp.2.weight", "time_text_embed.text_embedder.linear_2.weight"),
+  ("pos_embed", "pos_embed.pos_embed"),
+  ("final_layer.adaLN_modulation.1.bias", "norm_out.linear.bias", swap_scale_shift),
+  ("final_layer.adaLN_modulation.1.weight", "norm_out.linear.weight", swap_scale_shift),
+  ("final_layer.linear.bias", "proj_out.bias"),
+  ("final_layer.linear.weight", "proj_out.weight"),
+}
+
+
+MMDIT_MAP_BLOCK = {
+  ("context_block.adaLN_modulation.1.bias", "norm1_context.linear.bias"),
+  ("context_block.adaLN_modulation.1.weight", "norm1_context.linear.weight"),
+  ("context_block.attn.proj.bias", "attn.to_add_out.bias"),
+  ("context_block.attn.proj.weight", "attn.to_add_out.weight"),
+  ("context_block.mlp.fc1.bias", "ff_context.net.0.proj.bias"),
+  ("context_block.mlp.fc1.weight", "ff_context.net.0.proj.weight"),
+  ("context_block.mlp.fc2.bias", "ff_context.net.2.bias"),
+  ("context_block.mlp.fc2.weight", "ff_context.net.2.weight"),
+  ("context_block.attn.ln_q.weight", "attn.norm_added_q.weight"),
+  ("context_block.attn.ln_k.weight", "attn.norm_added_k.weight"),
+  ("x_block.adaLN_modulation.1.bias", "norm1.linear.bias"),
+  ("x_block.adaLN_modulation.1.weight", "norm1.linear.weight"),
+  ("x_block.attn.proj.bias", "attn.to_out.0.bias"),
+  ("x_block.attn.proj.weight", "attn.to_out.0.weight"),
+  ("x_block.attn.ln_q.weight", "attn.norm_q.weight"),
+  ("x_block.attn.ln_k.weight", "attn.norm_k.weight"),
+  ("x_block.attn2.proj.bias", "attn2.to_out.0.bias"),
+  ("x_block.attn2.proj.weight", "attn2.to_out.0.weight"),
+  ("x_block.attn2.ln_q.weight", "attn2.norm_q.weight"),
+  ("x_block.attn2.ln_k.weight", "attn2.norm_k.weight"),
+  ("x_block.mlp.fc1.bias", "ff.net.0.proj.bias"),
+  ("x_block.mlp.fc1.weight", "ff.net.0.proj.weight"),
+  ("x_block.mlp.fc2.bias", "ff.net.2.bias"),
+  ("x_block.mlp.fc2.weight", "ff.net.2.weight"),
+}
+
+
+def mmdit_to_diffusers(mmdit_config, output_prefix=""):
+  key_map = {}
+
+  depth = mmdit_config.get("depth", 0)
+  num_blocks = mmdit_config.get("num_blocks", depth)
+  for i in range(num_blocks):
+    block_from = "transformer_blocks.{}".format(i)
+    block_to = "{}joint_blocks.{}".format(output_prefix, i)
+
+    offset = depth * 64
+
+    for end in ("weight", "bias"):
+      k = "{}.attn.".format(block_from)
+      qkv = "{}.x_block.attn.qkv.{}".format(block_to, end)
+      key_map["{}to_q.{}".format(k, end)] = (qkv, (0, 0, offset))
+      key_map["{}to_k.{}".format(k, end)] = (qkv, (0, offset, offset))
+      key_map["{}to_v.{}".format(k, end)] = (qkv, (0, offset * 2, offset))
+
+      qkv = "{}.context_block.attn.qkv.{}".format(block_to, end)
+      key_map["{}add_q_proj.{}".format(k, end)] = (qkv, (0, 0, offset))
+      key_map["{}add_k_proj.{}".format(k, end)] = (qkv, (0, offset, offset))
+      key_map["{}add_v_proj.{}".format(k, end)] = (qkv, (0, offset * 2, offset))
+
+      k = "{}.attn2.".format(block_from)
+      qkv = "{}.x_block.attn2.qkv.{}".format(block_to, end)
+      key_map["{}to_q.{}".format(k, end)] = (qkv, (0, 0, offset))
+      key_map["{}to_k.{}".format(k, end)] = (qkv, (0, offset, offset))
+      key_map["{}to_v.{}".format(k, end)] = (qkv, (0, offset * 2, offset))
+
+    for k in MMDIT_MAP_BLOCK:
+      key_map["{}.{}".format(block_from, k[1])] = "{}.{}".format(block_to, k[0])
+
+  map_basic = MMDIT_MAP_BASIC.copy()
+  map_basic.add(
+    (
+      "joint_blocks.{}.context_block.adaLN_modulation.1.bias".format(depth - 1),
+      "transformer_blocks.{}.norm1_context.linear.bias".format(depth - 1),
+      swap_scale_shift,
+    )
+  )
+  map_basic.add(
+    (
+      "joint_blocks.{}.context_block.adaLN_modulation.1.weight".format(depth - 1),
+      "transformer_blocks.{}.norm1_context.linear.weight".format(depth - 1),
+      swap_scale_shift,
+    )
+  )
+
+  for k in map_basic:
+    if len(k) > 2:
+      key_map[k[1]] = ("{}{}".format(output_prefix, k[0]), None, k[2])
+    else:
+      key_map[k[1]] = "{}{}".format(output_prefix, k[0])
+
+  return key_map

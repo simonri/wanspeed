@@ -5,6 +5,7 @@ import math
 
 import src.supported_models as supported_models
 import src.supported_models_base as supported_models_base
+import src.utils as utils
 
 
 def count_blocks(state_dict_keys, prefix_string):
@@ -949,3 +950,629 @@ def model_config_from_unet(
     )
 
   return model_config
+
+
+def convert_config(unet_config):
+  new_config = unet_config.copy()
+  num_res_blocks = new_config.get("num_res_blocks", None)
+  channel_mult = new_config.get("channel_mult", None)
+
+  if isinstance(num_res_blocks, int):
+    num_res_blocks = len(channel_mult) * [num_res_blocks]
+
+  if "attention_resolutions" in new_config:
+    attention_resolutions = new_config.pop("attention_resolutions")
+    transformer_depth = new_config.get("transformer_depth", None)
+    transformer_depth_middle = new_config.get("transformer_depth_middle", None)
+
+    if isinstance(transformer_depth, int):
+      transformer_depth = len(channel_mult) * [transformer_depth]
+    if transformer_depth_middle is None:
+      transformer_depth_middle = transformer_depth[-1]
+    t_in = []
+    t_out = []
+    s = 1
+    for i in range(len(num_res_blocks)):
+      res = num_res_blocks[i]
+      d = 0
+      if s in attention_resolutions:
+        d = transformer_depth[i]
+
+      t_in += [d] * res
+      t_out += [d] * (res + 1)
+      s *= 2
+    transformer_depth = t_in
+    new_config["transformer_depth"] = t_in
+    new_config["transformer_depth_output"] = t_out
+    new_config["transformer_depth_middle"] = transformer_depth_middle
+
+  new_config["num_res_blocks"] = num_res_blocks
+  return new_config
+
+
+def unet_config_from_diffusers_unet(state_dict, dtype=None):
+  if "conv_in.weight" not in state_dict:
+    return None
+
+  match = {}
+  transformer_depth = []
+
+  attn_res = 1
+  down_blocks = count_blocks(state_dict, "down_blocks.{}")
+  for i in range(down_blocks):
+    attn_blocks = count_blocks(
+      state_dict, "down_blocks.{}.attentions.".format(i) + "{}"
+    )
+    res_blocks = count_blocks(state_dict, "down_blocks.{}.resnets.".format(i) + "{}")
+    for ab in range(attn_blocks):
+      transformer_count = count_blocks(
+        state_dict,
+        "down_blocks.{}.attentions.{}.transformer_blocks.".format(i, ab) + "{}",
+      )
+      transformer_depth.append(transformer_count)
+      if transformer_count > 0:
+        match["context_dim"] = state_dict[
+          "down_blocks.{}.attentions.{}.transformer_blocks.0.attn2.to_k.weight".format(
+            i, ab
+          )
+        ].shape[1]
+
+    attn_res *= 2
+    if attn_blocks == 0:
+      for i in range(res_blocks):
+        transformer_depth.append(0)
+
+  match["transformer_depth"] = transformer_depth
+
+  match["model_channels"] = state_dict["conv_in.weight"].shape[0]
+  match["in_channels"] = state_dict["conv_in.weight"].shape[1]
+  match["adm_in_channels"] = None
+  if "class_embedding.linear_1.weight" in state_dict:
+    match["adm_in_channels"] = state_dict["class_embedding.linear_1.weight"].shape[1]
+  elif "add_embedding.linear_1.weight" in state_dict:
+    match["adm_in_channels"] = state_dict["add_embedding.linear_1.weight"].shape[1]
+
+  SDXL = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2],
+    "transformer_depth": [0, 0, 2, 2, 10, 10],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": 10,
+    "use_linear_in_transformer": True,
+    "context_dim": 2048,
+    "num_head_channels": 64,
+    "transformer_depth_output": [0, 0, 0, 2, 2, 2, 10, 10, 10],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SDXL_refiner = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2560,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 384,
+    "num_res_blocks": [2, 2, 2, 2],
+    "transformer_depth": [0, 0, 4, 4, 4, 4, 0, 0],
+    "channel_mult": [1, 2, 4, 4],
+    "transformer_depth_middle": 4,
+    "use_linear_in_transformer": True,
+    "context_dim": 1280,
+    "num_head_channels": 64,
+    "transformer_depth_output": [0, 0, 0, 4, 4, 4, 4, 4, 4, 0, 0, 0],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SD21 = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "adm_in_channels": None,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2, 2],
+    "transformer_depth": [1, 1, 1, 1, 1, 1, 0, 0],
+    "channel_mult": [1, 2, 4, 4],
+    "transformer_depth_middle": 1,
+    "use_linear_in_transformer": True,
+    "context_dim": 1024,
+    "num_head_channels": 64,
+    "transformer_depth_output": [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SD21_uncliph = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2048,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2, 2],
+    "transformer_depth": [1, 1, 1, 1, 1, 1, 0, 0],
+    "channel_mult": [1, 2, 4, 4],
+    "transformer_depth_middle": 1,
+    "use_linear_in_transformer": True,
+    "context_dim": 1024,
+    "num_head_channels": 64,
+    "transformer_depth_output": [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SD21_unclipl = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 1536,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2, 2],
+    "transformer_depth": [1, 1, 1, 1, 1, 1, 0, 0],
+    "channel_mult": [1, 2, 4, 4],
+    "transformer_depth_middle": 1,
+    "use_linear_in_transformer": True,
+    "context_dim": 1024,
+    "num_head_channels": 64,
+    "transformer_depth_output": [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SD15 = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "adm_in_channels": None,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2, 2],
+    "transformer_depth": [1, 1, 1, 1, 1, 1, 0, 0],
+    "channel_mult": [1, 2, 4, 4],
+    "transformer_depth_middle": 1,
+    "use_linear_in_transformer": False,
+    "context_dim": 768,
+    "num_heads": 8,
+    "transformer_depth_output": [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SDXL_mid_cnet = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2],
+    "transformer_depth": [0, 0, 0, 0, 1, 1],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": 1,
+    "use_linear_in_transformer": True,
+    "context_dim": 2048,
+    "num_head_channels": 64,
+    "transformer_depth_output": [0, 0, 0, 0, 0, 0, 1, 1, 1],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SDXL_small_cnet = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2],
+    "transformer_depth": [0, 0, 0, 0, 0, 0],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": 0,
+    "use_linear_in_transformer": True,
+    "num_head_channels": 64,
+    "context_dim": 1,
+    "transformer_depth_output": [0, 0, 0, 0, 0, 0, 0, 0, 0],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SDXL_diffusers_inpaint = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 9,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2],
+    "transformer_depth": [0, 0, 2, 2, 10, 10],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": 10,
+    "use_linear_in_transformer": True,
+    "context_dim": 2048,
+    "num_head_channels": 64,
+    "transformer_depth_output": [0, 0, 0, 2, 2, 2, 10, 10, 10],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SDXL_diffusers_ip2p = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 8,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2],
+    "transformer_depth": [0, 0, 2, 2, 10, 10],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": 10,
+    "use_linear_in_transformer": True,
+    "context_dim": 2048,
+    "num_head_channels": 64,
+    "transformer_depth_output": [0, 0, 0, 2, 2, 2, 10, 10, 10],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SSD_1B = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2],
+    "transformer_depth": [0, 0, 2, 2, 4, 4],
+    "transformer_depth_output": [0, 0, 0, 1, 1, 2, 10, 4, 4],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": -1,
+    "use_linear_in_transformer": True,
+    "context_dim": 2048,
+    "num_head_channels": 64,
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  Segmind_Vega = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2],
+    "transformer_depth": [0, 0, 1, 1, 2, 2],
+    "transformer_depth_output": [0, 0, 0, 1, 1, 1, 2, 2, 2],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": -1,
+    "use_linear_in_transformer": True,
+    "context_dim": 2048,
+    "num_head_channels": 64,
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  KOALA_700M = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [1, 1, 1],
+    "transformer_depth": [0, 2, 5],
+    "transformer_depth_output": [0, 0, 2, 2, 5, 5],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": -2,
+    "use_linear_in_transformer": True,
+    "context_dim": 2048,
+    "num_head_channels": 64,
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  KOALA_1B = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "num_classes": "sequential",
+    "adm_in_channels": 2816,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [1, 1, 1],
+    "transformer_depth": [0, 2, 6],
+    "transformer_depth_output": [0, 0, 2, 2, 6, 6],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": 6,
+    "use_linear_in_transformer": True,
+    "context_dim": 2048,
+    "num_head_channels": 64,
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SD09_XS = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "adm_in_channels": None,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [1, 1, 1],
+    "transformer_depth": [1, 1, 1],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": -2,
+    "use_linear_in_transformer": True,
+    "context_dim": 1024,
+    "num_head_channels": 64,
+    "transformer_depth_output": [1, 1, 1, 1, 1, 1],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+    "disable_self_attentions": [True, False, False],
+  }
+
+  SD_XS = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "adm_in_channels": None,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [1, 1, 1],
+    "transformer_depth": [0, 1, 1],
+    "channel_mult": [1, 2, 4],
+    "transformer_depth_middle": -2,
+    "use_linear_in_transformer": False,
+    "context_dim": 768,
+    "num_head_channels": 64,
+    "transformer_depth_output": [0, 0, 1, 1, 1, 1],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  SD15_diffusers_inpaint = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "adm_in_channels": None,
+    "dtype": dtype,
+    "in_channels": 9,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2, 2],
+    "transformer_depth": [1, 1, 1, 1, 1, 1, 0, 0],
+    "channel_mult": [1, 2, 4, 4],
+    "transformer_depth_middle": 1,
+    "use_linear_in_transformer": False,
+    "context_dim": 768,
+    "num_heads": 8,
+    "transformer_depth_output": [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  LotusD = {
+    "use_checkpoint": False,
+    "image_size": 32,
+    "out_channels": 4,
+    "use_spatial_transformer": True,
+    "legacy": False,
+    "adm_in_channels": 4,
+    "dtype": dtype,
+    "in_channels": 4,
+    "model_channels": 320,
+    "num_res_blocks": [2, 2, 2, 2],
+    "transformer_depth": [1, 1, 1, 1, 1, 1, 0, 0],
+    "channel_mult": [1, 2, 4, 4],
+    "transformer_depth_middle": 1,
+    "use_linear_in_transformer": True,
+    "context_dim": 1024,
+    "num_heads": 8,
+    "transformer_depth_output": [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+    "use_temporal_attention": False,
+    "use_temporal_resblock": False,
+  }
+
+  supported_models = [
+    LotusD,
+    SDXL,
+    SDXL_refiner,
+    SD21,
+    SD15,
+    SD21_uncliph,
+    SD21_unclipl,
+    SDXL_mid_cnet,
+    SDXL_small_cnet,
+    SDXL_diffusers_inpaint,
+    SSD_1B,
+    Segmind_Vega,
+    KOALA_700M,
+    KOALA_1B,
+    SD09_XS,
+    SD_XS,
+    SDXL_diffusers_ip2p,
+    SD15_diffusers_inpaint,
+  ]
+
+  for unet_config in supported_models:
+    matches = True
+    for k in match:
+      if match[k] != unet_config[k]:
+        matches = False
+        break
+    if matches:
+      return convert_config(unet_config)
+  return None
+
+
+def model_config_from_diffusers_unet(state_dict):
+  unet_config = unet_config_from_diffusers_unet(state_dict)
+  if unet_config is not None:
+    return model_config_from_unet_config(unet_config)
+  return None
+
+
+def unet_prefix_from_state_dict(state_dict):
+  candidates = [
+    "model.diffusion_model.",  # ldm/sgm models
+    "model.model.",  # audio models
+    "net.",  # cosmos
+  ]
+  counts = {k: 0 for k in candidates}
+  for k in state_dict:
+    for c in candidates:
+      if k.startswith(c):
+        counts[c] += 1
+        break
+
+  top = max(counts, key=counts.get)
+  if counts[top] > 5:
+    return top
+  else:
+    return "model."  # aura flow and others
+
+
+def convert_diffusers_mmdit(state_dict, output_prefix=""):
+  out_sd = {}
+
+  if "joint_transformer_blocks.0.attn.add_k_proj.weight" in state_dict:  # AuraFlow
+    num_joint = count_blocks(state_dict, "joint_transformer_blocks.{}.")
+    num_single = count_blocks(state_dict, "single_transformer_blocks.{}.")
+    sd_map = utils.auraflow_to_diffusers(
+      {"n_double_layers": num_joint, "n_layers": num_joint + num_single},
+      output_prefix=output_prefix,
+    )
+  elif (
+    "adaln_single.emb.timestep_embedder.linear_1.bias" in state_dict
+    and "pos_embed.proj.bias" in state_dict
+  ):  # PixArt
+    num_blocks = count_blocks(state_dict, "transformer_blocks.{}.")
+    sd_map = utils.pixart_to_diffusers(
+      {"depth": num_blocks}, output_prefix=output_prefix
+    )
+  elif "x_embedder.weight" in state_dict:  # Flux
+    depth = count_blocks(state_dict, "transformer_blocks.{}.")
+    depth_single_blocks = count_blocks(state_dict, "single_transformer_blocks.{}.")
+    hidden_size = state_dict["x_embedder.bias"].shape[0]
+    sd_map = utils.flux_to_diffusers(
+      {
+        "depth": depth,
+        "depth_single_blocks": depth_single_blocks,
+        "hidden_size": hidden_size,
+      },
+      output_prefix=output_prefix,
+    )
+  elif (
+    "transformer_blocks.0.attn.add_q_proj.weight" in state_dict
+    and "pos_embed.proj.weight" in state_dict
+  ):  # SD3
+    num_blocks = count_blocks(state_dict, "transformer_blocks.{}.")
+    depth = state_dict["pos_embed.proj.weight"].shape[0] // 64
+    sd_map = utils.mmdit_to_diffusers(
+      {"depth": depth, "num_blocks": num_blocks}, output_prefix=output_prefix
+    )
+  else:
+    return None
+
+  for k in sd_map:
+    weight = state_dict.get(k, None)
+    if weight is not None:
+      t = sd_map[k]
+
+      if not isinstance(t, str):
+        if len(t) > 2:
+          fun = t[2]
+        else:
+          fun = lambda a: a
+        offset = t[1]
+        if offset is not None:
+          old_weight = out_sd.get(t[0], None)
+          if old_weight is None:
+            old_weight = torch.empty_like(weight)
+          if old_weight.shape[offset[0]] < offset[1] + offset[2]:
+            exp = list(weight.shape)
+            exp[offset[0]] = offset[1] + offset[2]
+            new = torch.empty(exp, device=weight.device, dtype=weight.dtype)
+            new[: old_weight.shape[0]] = old_weight
+            old_weight = new
+
+          w = old_weight.narrow(offset[0], offset[1], offset[2])
+        else:
+          old_weight = weight
+          w = weight
+        w[:] = fun(weight)
+        t = t[0]
+        out_sd[t] = old_weight
+      else:
+        out_sd[t] = weight
+      state_dict.pop(k)
+
+  return out_sd

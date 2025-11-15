@@ -1,28 +1,14 @@
 import torch
 import logging
 import math
-from enum import Enum
 from src.wan.model import WanModel
-from src.model_sampling import model_sampling
+from src.model_sampling import model_sampling, ModelType
 from src.ops import pick_operations
 from src.model_management import cast_to_device
 from src.conds import CONDRegular, CONDNoiseShape, CONDCrossAttn
 import src.utils as utils
 import src.model_management as model_management
 import src.patcher_extension as patcher_extension
-
-
-class ModelType(Enum):
-  EPS = 1
-  V_PREDICTION = 2
-  V_PREDICTION_EDM = 3
-  STABLE_CASCADE = 4
-  EDM = 5
-  FLOW = 6
-  V_PREDICTION_CONTINUOUS = 7
-  FLUX = 8
-  IMG_TO_IMG = 9
-  FLOW_COSMOS = 10
 
 
 def convert_tensor(extra, dtype, device):

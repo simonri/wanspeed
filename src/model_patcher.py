@@ -2,10 +2,229 @@ import logging
 import torch
 import uuid
 import copy
+import math
 import inspect
 from typing import Callable, Optional
 import src.model_management as model_management
 import src.utils as utils
+import src.hooks as hooks
+import src.lora as lora
+import src.float as _float
+from src.patcher_extension import CallbacksMP, WrappersMP, PatcherInjection
+
+import collections
+
+
+class AutoPatcherEjector:
+  def __init__(self, model: "ModelPatcher", skip_and_inject_on_exit_only=False):
+    self.model = model
+    self.was_injected = False
+    self.prev_skip_injection = False
+    self.skip_and_inject_on_exit_only = skip_and_inject_on_exit_only
+
+  def __enter__(self):
+    self.was_injected = False
+    self.prev_skip_injection = self.model.skip_injection
+    if self.skip_and_inject_on_exit_only:
+      self.model.skip_injection = True
+    if self.model.is_injected:
+      self.model.eject_model()
+      self.was_injected = True
+
+  def __exit__(self, *args):
+    if self.skip_and_inject_on_exit_only:
+      self.model.skip_injection = self.prev_skip_injection
+      self.model.inject_model()
+    if self.was_injected and not self.model.skip_injection:
+      self.model.inject_model()
+    self.model.skip_injection = self.prev_skip_injection
+
+
+class LowVramPatch:
+  def __init__(self, key, patches, convert_func=None, set_func=None):
+    self.key = key
+    self.patches = patches
+    self.convert_func = convert_func
+    self.set_func = set_func
+
+  def __call__(self, weight):
+    intermediate_dtype = weight.dtype
+    if self.convert_func is not None:
+      weight = self.convert_func(
+        weight.to(dtype=torch.float32, copy=True), inplace=True
+      )
+
+    if intermediate_dtype not in [
+      torch.float32,
+      torch.float16,
+      torch.bfloat16,
+    ]:  # intermediate_dtype has to be one that is supported in math ops
+      intermediate_dtype = torch.float32
+      out = lora.calculate_weight(
+        self.patches[self.key],
+        weight.to(intermediate_dtype),
+        self.key,
+        intermediate_dtype=intermediate_dtype,
+      )
+      if self.set_func is None:
+        return _float.stochastic_rounding(
+          out, weight.dtype, seed=string_to_seed(self.key)
+        )
+      else:
+        return self.set_func(out, seed=string_to_seed(self.key), return_weight=True)
+
+    out = lora.calculate_weight(
+      self.patches[self.key], weight, self.key, intermediate_dtype=intermediate_dtype
+    )
+    if self.set_func is not None:
+      return self.set_func(out, seed=string_to_seed(self.key), return_weight=True).to(
+        dtype=intermediate_dtype
+      )
+    else:
+      return out
+
+
+def wipe_lowvram_weight(m):
+  if hasattr(m, "prev_comfy_cast_weights"):
+    m.comfy_cast_weights = m.prev_comfy_cast_weights
+    del m.prev_comfy_cast_weights
+
+  if hasattr(m, "weight_function"):
+    m.weight_function = []
+
+  if hasattr(m, "bias_function"):
+    m.bias_function = []
+
+
+def set_model_options_patch_replace(
+  model_options, patch, name, block_name, number, transformer_index=None
+):
+  to = model_options["transformer_options"].copy()
+
+  if "patches_replace" not in to:
+    to["patches_replace"] = {}
+  else:
+    to["patches_replace"] = to["patches_replace"].copy()
+
+  if name not in to["patches_replace"]:
+    to["patches_replace"][name] = {}
+  else:
+    to["patches_replace"][name] = to["patches_replace"][name].copy()
+
+  if transformer_index is not None:
+    block = (block_name, number, transformer_index)
+  else:
+    block = (block_name, number)
+  to["patches_replace"][name][block] = patch
+  model_options["transformer_options"] = to
+  return model_options
+
+
+def move_weight_functions(m, device):
+  if device is None:
+    return 0
+
+  memory = 0
+  if hasattr(m, "weight_function"):
+    for f in m.weight_function:
+      if hasattr(f, "move_to"):
+        memory += f.move_to(device=device)
+
+  if hasattr(m, "bias_function"):
+    for f in m.bias_function:
+      if hasattr(f, "move_to"):
+        memory += f.move_to(device=device)
+  return memory
+
+
+def string_to_seed(data):
+  crc = 0xFFFFFFFF
+  for byte in data:
+    if isinstance(byte, str):
+      byte = ord(byte)
+    crc ^= byte
+    for _ in range(8):
+      if crc & 1:
+        crc = (crc >> 1) ^ 0xEDB88320
+      else:
+        crc >>= 1
+  return crc ^ 0xFFFFFFFF
+
+
+def create_hook_patches_clone(orig_hook_patches):
+  new_hook_patches = {}
+  for hook_ref in orig_hook_patches:
+    new_hook_patches[hook_ref] = {}
+    for k in orig_hook_patches[hook_ref]:
+      new_hook_patches[hook_ref][k] = orig_hook_patches[hook_ref][k][:]
+  return new_hook_patches
+
+
+def set_model_options_post_cfg_function(
+  model_options, post_cfg_function, disable_cfg1_optimization=False
+):
+  model_options["sampler_post_cfg_function"] = model_options.get(
+    "sampler_post_cfg_function", []
+  ) + [post_cfg_function]
+  if disable_cfg1_optimization:
+    model_options["disable_cfg1_optimization"] = True
+  return model_options
+
+
+def set_model_options_pre_cfg_function(
+  model_options, pre_cfg_function, disable_cfg1_optimization=False
+):
+  model_options["sampler_pre_cfg_function"] = model_options.get(
+    "sampler_pre_cfg_function", []
+  ) + [pre_cfg_function]
+  if disable_cfg1_optimization:
+    model_options["disable_cfg1_optimization"] = True
+  return model_options
+
+
+def get_key_weight(model, key):
+  set_func = None
+  convert_func = None
+  op_keys = key.rsplit(".", 1)
+  if len(op_keys) < 2:
+    weight = utils.get_attr(model, key)
+  else:
+    op = utils.get_attr(model, op_keys[0])
+    try:
+      set_func = getattr(op, "set_{}".format(op_keys[1]))
+    except AttributeError:
+      pass
+
+    try:
+      convert_func = getattr(op, "convert_{}".format(op_keys[1]))
+    except AttributeError:
+      pass
+
+    weight = getattr(op, op_keys[1])
+    if convert_func is not None:
+      weight = utils.get_attr(model, key)
+
+  return weight, set_func, convert_func
+
+
+class MemoryCounter:
+  def __init__(self, initial: int, minimum=0):
+    self.value = initial
+    self.minimum = minimum
+    # TODO: add a safe limit besides 0
+
+  def use(self, weight: torch.Tensor):
+    weight_size = weight.nelement() * weight.element_size()
+    if self.is_useable(weight_size):
+      self.decrement(weight_size)
+      return True
+    return False
+
+  def is_useable(self, used: int):
+    return self.value - used > self.minimum
+
+  def decrement(self, used: int):
+    self.value -= used
 
 
 class ModelPatcher:
@@ -44,16 +263,16 @@ class ModelPatcher:
     self.skip_injection = False
     self.injections: dict[str, list[PatcherInjection]] = {}
 
-    self.hook_patches: dict[comfy.hooks._HookRef] = {}
-    self.hook_patches_backup: dict[comfy.hooks._HookRef] = None
+    self.hook_patches: dict[hooks._HookRef] = {}
+    self.hook_patches_backup: dict[hooks._HookRef] = None
     self.hook_backup: dict[str, tuple[torch.Tensor, torch.device]] = {}
-    self.cached_hook_patches: dict[comfy.hooks.HookGroup, dict[str, torch.Tensor]] = {}
-    self.current_hooks: Optional[comfy.hooks.HookGroup] = None
-    self.forced_hooks: Optional[comfy.hooks.HookGroup] = (
+    self.cached_hook_patches: dict[hooks.HookGroup, dict[str, torch.Tensor]] = {}
+    self.current_hooks: Optional[hooks.HookGroup] = None
+    self.forced_hooks: Optional[hooks.HookGroup] = (
       None  # NOTE: only used for CLIP at this time
     )
     self.is_clip = False
-    self.hook_mode = comfy.hooks.EnumHookMode.MaxSpeed
+    self.hook_mode = hooks.EnumHookMode.MaxSpeed
 
     if not hasattr(self.model, "model_loaded_weight_memory"):
       self.model.model_loaded_weight_memory = 0
@@ -70,7 +289,7 @@ class ModelPatcher:
   def model_size(self):
     if self.size > 0:
       return self.size
-    self.size = comfy.model_management.module_size(self.model)
+    self.size = model_management.module_size(self.model)
     return self.size
 
   def get_ram_usage(self):
@@ -230,7 +449,7 @@ class ModelPatcher:
       sampler_calc_cond_batch_function
     )
 
-  def set_model_unet_function_wrapper(self, unet_wrapper_function: UnetWrapperFunction):
+  def set_model_unet_function_wrapper(self, unet_wrapper_function):
     self.model_options["model_function_wrapper"] = unet_wrapper_function
 
   def set_model_denoise_mask_function(self, denoise_mask_function):
@@ -344,7 +563,7 @@ class ModelPatcher:
       if name in self.object_patches_backup:
         return self.object_patches_backup[name]
       else:
-        return comfy.utils.get_attr(self.model, name)
+        return utils.get_attr(self.model, name)
 
   def model_patches_to(self, device):
     to = self.model_options["transformer_options"]
@@ -475,27 +694,27 @@ class ModelPatcher:
     if convert_func is not None:
       temp_weight = convert_func(temp_weight, inplace=True)
 
-    out_weight = comfy.lora.calculate_weight(self.patches[key], temp_weight, key)
+    out_weight = lora.calculate_weight(self.patches[key], temp_weight, key)
     if set_func is None:
-      out_weight = comfy.float.stochastic_rounding(
+      out_weight = float.stochastic_rounding(
         out_weight, weight.dtype, seed=string_to_seed(key)
       )
       if inplace_update:
-        comfy.utils.copy_to_param(self.model, key, out_weight)
+        utils.copy_to_param(self.model, key, out_weight)
       else:
-        comfy.utils.set_attr_param(self.model, key, out_weight)
+        utils.set_attr_param(self.model, key, out_weight)
     else:
       set_func(out_weight, inplace_update=inplace_update, seed=string_to_seed(key))
 
   def pin_weight_to_device(self, key):
     weight, set_func, convert_func = get_key_weight(self.model, key)
-    if comfy.model_management.pin_memory(weight):
+    if model_management.pin_memory(weight):
       self.pinned.add(key)
 
   def unpin_weight(self, key):
     if key in self.pinned:
       weight, set_func, convert_func = get_key_weight(self.model, key)
-      comfy.model_management.unpin_memory(weight)
+      model_management.unpin_memory(weight)
       self.pinned.remove(key)
 
   def unpin_all_weights(self):
@@ -514,7 +733,7 @@ class ModelPatcher:
           skip = True  # skip random weights in non leaf modules
           break
       if not skip and (hasattr(m, "comfy_cast_weights") or len(params) > 0):
-        loading.append((comfy.model_management.module_size(m), n, m, params))
+        loading.append((model_management.module_size(m), n, m, params))
     return loading
 
   def load(
@@ -722,7 +941,7 @@ class ModelPatcher:
 
     keys = list(self.object_patches_backup.keys())
     for k in keys:
-      comfy.utils.set_attr(self.model, k, self.object_patches_backup[k])
+      utils.set_attr(self.model, k, self.object_patches_backup[k])
 
     self.object_patches_backup.clear()
 
@@ -866,7 +1085,7 @@ class ModelPatcher:
     logging.warning(
       "The ModelPatcher.calculate_weight function is deprecated, please use: comfy.lora.calculate_weight instead"
     )
-    return comfy.lora.calculate_weight(
+    return lora.calculate_weight(
       patches, weight, key, intermediate_dtype=intermediate_dtype
     )
 
@@ -1019,11 +1238,11 @@ class ModelPatcher:
       self.hook_patches = self.hook_patches_backup
       self.hook_patches_backup = None
 
-  def set_hook_mode(self, hook_mode: comfy.hooks.EnumHookMode):
+  def set_hook_mode(self, hook_mode: hooks.EnumHookMode):
     self.hook_mode = hook_mode
 
   def prepare_hook_patches_current_keyframe(
-    self, t: torch.Tensor, hook_group: comfy.hooks.HookGroup, model_options: dict[str]
+    self, t: torch.Tensor, hook_group: hooks.HookGroup, model_options: dict[str]
   ):
     curr_t = t[0]
     reset_current_hooks = False
@@ -1049,17 +1268,17 @@ class ModelPatcher:
 
   def register_all_hook_patches(
     self,
-    hooks: comfy.hooks.HookGroup,
+    hooks: hooks.HookGroup,
     target_dict: dict[str],
     model_options: dict = None,
-    registered: comfy.hooks.HookGroup = None,
+    registered: hooks.HookGroup = None,
   ):
     self.restore_hook_patches()
     if registered is None:
-      registered = comfy.hooks.HookGroup()
+      registered = hooks.HookGroup()
     # handle WeightHooks
-    weight_hooks_to_register: list[comfy.hooks.WeightHook] = []
-    for hook in hooks.get_type(comfy.hooks.EnumHookType.Weight):
+    weight_hooks_to_register: list[hooks.WeightHook] = []
+    for hook in hooks.get_type(hooks.EnumHookType.Weight):
       if hook.hook_ref not in self.hook_patches:
         weight_hooks_to_register.append(hook)
       else:
@@ -1074,7 +1293,7 @@ class ModelPatcher:
     return registered
 
   def add_hook_patches(
-    self, hook: comfy.hooks.WeightHook, patches, strength_patch=1.0, strength_model=1.0
+    self, hook: hooks.WeightHook, patches, strength_patch=1.0, strength_model=1.0
   ):
     with self.use_ejected():
       # NOTE: this mirrors behavior of add_patches func
@@ -1104,7 +1323,7 @@ class ModelPatcher:
       self.patches_uuid = uuid.uuid4()
       return list(p)
 
-  def get_combined_hook_patches(self, hooks: comfy.hooks.HookGroup):
+  def get_combined_hook_patches(self, hooks: hooks.HookGroup):
     # combined_patches will contain  weights of all relevant hooks, per key
     combined_patches = {}
     if hooks is not None:
@@ -1125,7 +1344,7 @@ class ModelPatcher:
 
   def apply_hooks(
     self,
-    hooks: comfy.hooks.HookGroup,
+    hooks: hooks.HookGroup,
     transformer_options: dict = None,
     force_apply=False,
   ):
@@ -1133,26 +1352,24 @@ class ModelPatcher:
     if self.current_hooks == hooks and (
       not force_apply or (not self.is_clip and hooks is None)
     ):
-      return comfy.hooks.create_transformer_options_from_hooks(
+      return hooks.create_transformer_options_from_hooks(
         self, hooks, transformer_options
       )
     self.patch_hooks(hooks=hooks)
     for callback in self.get_all_callbacks(CallbacksMP.ON_APPLY_HOOKS):
       callback(self, hooks)
-    return comfy.hooks.create_transformer_options_from_hooks(
-      self, hooks, transformer_options
-    )
+    return hooks.create_transformer_options_from_hooks(self, hooks, transformer_options)
 
-  def patch_hooks(self, hooks: comfy.hooks.HookGroup):
+  def patch_hooks(self, hooks: hooks.HookGroup):
     with self.use_ejected():
       if hooks is not None:
         model_sd_keys = list(self.model_state_dict().keys())
         memory_counter = None
-        if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
+        if self.hook_mode == hooks.EnumHookMode.MaxSpeed:
           # TODO: minimum_counter should have a minimum that conforms to loaded model requirements
           memory_counter = MemoryCounter(
-            initial=comfy.model_management.get_free_memory(self.load_device),
-            minimum=comfy.model_management.minimum_inference_memory() * 2,
+            initial=model_management.get_free_memory(self.load_device),
+            minimum=model_management.minimum_inference_memory() * 2,
           )
         # if have cached weights for hooks, use it
         cached_weights = self.cached_hook_patches.get(hooks, None)
@@ -1196,9 +1413,9 @@ class ModelPatcher:
     self, cached_weights: dict, key: str, memory_counter: MemoryCounter
   ):
     if key not in self.hook_backup:
-      weight: torch.Tensor = comfy.utils.get_attr(self.model, key)
+      weight: torch.Tensor = utils.get_attr(self.model, key)
       target_device = self.offload_device
-      if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
+      if self.hook_mode == hooks.EnumHookMode.MaxSpeed:
         used = memory_counter.use(weight)
         if used:
           target_device = weight.device
@@ -1206,7 +1423,7 @@ class ModelPatcher:
         weight.to(device=target_device, copy=True),
         weight.device,
       )
-    comfy.utils.copy_to_param(
+    utils.copy_to_param(
       self.model, key, cached_weights[key][0].to(device=cached_weights[key][1])
     )
 
@@ -1216,7 +1433,7 @@ class ModelPatcher:
 
   def patch_hook_weight_to_device(
     self,
-    hooks: comfy.hooks.HookGroup,
+    hooks: hooks.HookGroup,
     combined_patches: dict,
     key: str,
     original_weights: dict,
@@ -1229,7 +1446,7 @@ class ModelPatcher:
     weight: torch.Tensor
     if key not in self.hook_backup:
       target_device = self.offload_device
-      if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
+      if self.hook_mode == hooks.EnumHookMode.MaxSpeed:
         used = memory_counter.use(weight)
         if used:
           target_device = weight.device
@@ -1238,24 +1455,24 @@ class ModelPatcher:
         weight.device,
       )
     # TODO: properly handle LowVramPatch, if it ends up an issue
-    temp_weight = comfy.model_management.cast_to_device(
+    temp_weight = model_management.cast_to_device(
       weight, weight.device, torch.float32, copy=True
     )
     if convert_func is not None:
       temp_weight = convert_func(temp_weight, inplace=True)
 
-    out_weight = comfy.lora.calculate_weight(
+    out_weight = lora.calculate_weight(
       combined_patches[key], temp_weight, key, original_weights=original_weights
     )
     del original_weights[key]
     if set_func is None:
-      out_weight = comfy.float.stochastic_rounding(
+      out_weight = _float.stochastic_rounding(
         out_weight, weight.dtype, seed=string_to_seed(key)
       )
-      comfy.utils.copy_to_param(self.model, key, out_weight)
+      utils.copy_to_param(self.model, key, out_weight)
     else:
       set_func(out_weight, inplace_update=True, seed=string_to_seed(key))
-    if self.hook_mode == comfy.hooks.EnumHookMode.MaxSpeed:
+    if self.hook_mode == hooks.EnumHookMode.MaxSpeed:
       # TODO: disable caching if not enough system RAM to do so
       target_device = self.offload_device
       used = memory_counter.use(weight)
@@ -1279,13 +1496,13 @@ class ModelPatcher:
       if whitelist_keys_set:
         for k in keys:
           if k in whitelist_keys_set:
-            comfy.utils.copy_to_param(
+            utils.copy_to_param(
               self.model, k, self.hook_backup[k][0].to(device=self.hook_backup[k][1])
             )
             self.hook_backup.pop(k)
       else:
         for k in keys:
-          comfy.utils.copy_to_param(
+          utils.copy_to_param(
             self.model, k, self.hook_backup[k][0].to(device=self.hook_backup[k][1])
           )
 
