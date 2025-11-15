@@ -585,3 +585,12 @@ def scaled_fp8_ops(fp8_matrix_mult=False, scale_input=False, override_dtype=None
           self.weight = torch.nn.Parameter(weight, requires_grad=False)
 
   return scaled_fp8_op
+
+
+cast_to = model_management.cast_to  # TODO: remove once no more references
+
+
+def cast_to_input(weight, input, non_blocking=False, copy=True):
+  return model_management.cast_to(
+    weight, input.dtype, input.device, non_blocking=non_blocking, copy=copy
+  )

@@ -5,6 +5,7 @@ import psutil
 import gc
 import weakref
 import sys
+import threading
 
 
 def is_device_type(device, type):
@@ -815,3 +816,43 @@ def vae_dtype(device=None, allowed_dtypes=[]):
 
 def intermediate_device():
   return torch.device("cpu")
+
+
+def load_model_gpu(model):
+  return load_models_gpu([model])
+
+
+class InterruptProcessingException(Exception):
+  pass
+
+
+interrupt_processing_mutex = threading.RLock()
+interrupt_processing = False
+
+
+def throw_exception_if_processing_interrupted():
+  global interrupt_processing
+  global interrupt_processing_mutex
+  with interrupt_processing_mutex:
+    if interrupt_processing:
+      interrupt_processing = False
+      raise InterruptProcessingException()
+
+
+def is_device_cuda(device):
+  return is_device_type(device, "cuda")
+
+
+def current_stream(device):
+  if device is None:
+    return None
+  if is_device_cuda(device):
+    return torch.cuda.current_stream()
+  else:
+    return None
+
+
+def sync_stream(device, stream):
+  if stream is None or current_stream(device) is None:
+    return
+  current_stream(device).wait_stream(stream)

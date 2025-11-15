@@ -22,4 +22,4 @@ class CLIPLoader:
       clip_type=clip_type,
       model_options=model_options,
     )
-    return (clip,)
+    return clip
