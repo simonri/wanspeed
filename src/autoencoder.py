@@ -1,9 +1,12 @@
 import torch
 import logging
+import math
 from typing import Any, Dict, Union, Tuple
 from contextlib import contextmanager
-from src.utils import get_obj_from_str, instantiate_from_config
-from src.model_management import LitEma
+from src.util import get_obj_from_str, instantiate_from_config
+from src.ema import LitEma
+import src.ops as ops
+
 
 class AbstractAutoencoder(torch.nn.Module):
   """
@@ -115,3 +118,89 @@ class AutoencodingEngine(AbstractAutoencoder):
     z, reg_log = self.encode(x, return_reg_log=True)
     dec = self.decode(z, **additional_decode_kwargs)
     return z, dec, reg_log
+
+
+class AutoencodingEngineLegacy(AutoencodingEngine):
+  def __init__(self, embed_dim: int, **kwargs):
+    self.max_batch_size = kwargs.pop("max_batch_size", None)
+    ddconfig = kwargs.pop("ddconfig")
+    super().__init__(
+      encoder_config={
+        "target": "comfy.ldm.modules.diffusionmodules.model.Encoder",
+        "params": ddconfig,
+      },
+      decoder_config={
+        "target": "comfy.ldm.modules.diffusionmodules.model.Decoder",
+        "params": ddconfig,
+      },
+      **kwargs,
+    )
+
+    if ddconfig.get("conv3d", False):
+      conv_op = ops.disable_weight_init.Conv3d
+    else:
+      conv_op = ops.disable_weight_init.Conv2d
+
+    self.quant_conv = conv_op(
+      (1 + ddconfig["double_z"]) * ddconfig["z_channels"],
+      (1 + ddconfig["double_z"]) * embed_dim,
+      1,
+    )
+
+    self.post_quant_conv = conv_op(embed_dim, ddconfig["z_channels"], 1)
+    self.embed_dim = embed_dim
+
+  def get_autoencoder_params(self) -> list:
+    params = super().get_autoencoder_params()
+    return params
+
+  def encode(
+    self, x: torch.Tensor, return_reg_log: bool = False
+  ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+    if self.max_batch_size is None:
+      z = self.encoder(x)
+      z = self.quant_conv(z)
+    else:
+      N = x.shape[0]
+      bs = self.max_batch_size
+      n_batches = int(math.ceil(N / bs))
+      z = list()
+      for i_batch in range(n_batches):
+        z_batch = self.encoder(x[i_batch * bs : (i_batch + 1) * bs])
+        z_batch = self.quant_conv(z_batch)
+        z.append(z_batch)
+      z = torch.cat(z, 0)
+
+    z, reg_log = self.regularization(z)
+    if return_reg_log:
+      return z, reg_log
+    return z
+
+  def decode(self, z: torch.Tensor, **decoder_kwargs) -> torch.Tensor:
+    if self.max_batch_size is None:
+      dec = self.post_quant_conv(z)
+      dec = self.decoder(dec, **decoder_kwargs)
+    else:
+      N = z.shape[0]
+      bs = self.max_batch_size
+      n_batches = int(math.ceil(N / bs))
+      dec = list()
+      for i_batch in range(n_batches):
+        dec_batch = self.post_quant_conv(z[i_batch * bs : (i_batch + 1) * bs])
+        dec_batch = self.decoder(dec_batch, **decoder_kwargs)
+        dec.append(dec_batch)
+      dec = torch.cat(dec, 0)
+
+    return dec
+
+
+class AutoencoderKL(AutoencodingEngineLegacy):
+  def __init__(self, **kwargs):
+    if "lossconfig" in kwargs:
+      kwargs["loss_config"] = kwargs.pop("lossconfig")
+    super().__init__(
+      regularizer_config={
+        "target": ("comfy.ldm.models.autoencoder.DiagonalGaussianRegularizer")
+      },
+      **kwargs,
+    )

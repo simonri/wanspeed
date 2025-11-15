@@ -788,3 +788,30 @@ def load_models_gpu(
     )
     current_loaded_models.insert(0, loaded_model)
   return
+
+
+def pytorch_attention_enabled_vae():
+  return pytorch_attention_enabled()
+
+
+def vae_device():
+  return get_torch_device()
+
+
+def vae_offload_device():
+  return torch.device("cpu")
+
+
+def vae_dtype(device=None, allowed_dtypes=[]):
+  for d in allowed_dtypes:
+    if d == torch.float16 and should_use_fp16(device):
+      return d
+
+    if d == torch.bfloat16 and should_use_bf16(device):
+      return d
+
+  return torch.float32
+
+
+def intermediate_device():
+  return torch.device("cpu")

@@ -1,10 +1,12 @@
 import src.model_management as model_management
 import src.diffusers_convert as diffusers_convert
-from src.autoencoder import AutoencodingEngine
 import torch
 import math
-import json
 import logging
+import src.model_patcher as model_patcher
+from src.autoencoder import AutoencodingEngine, AutoencoderKL
+import src.wan.vae2_2 as vae2_2
+import src.wan.vae as vae
 
 
 class VAE:
@@ -12,10 +14,7 @@ class VAE:
     if "decoder.up_blocks.0.resnets.0.norm1.weight" in sd.keys():  # diffusers format
       sd = diffusers_convert.convert_vae_state_dict(sd)
 
-    if model_management.is_amd():
-      VAE_KL_MEM_RATIO = 2.73
-    else:
-      VAE_KL_MEM_RATIO = 1.0
+    VAE_KL_MEM_RATIO = 1.0
 
     self.memory_used_encode = (
       lambda shape, dtype: (1767 * shape[2] * shape[3])
@@ -256,62 +255,6 @@ class VAE:
         self.working_dtypes = [torch.float16, torch.bfloat16, torch.float32]
         self.disable_offload = True
       elif (
-        "blocks.2.blocks.3.stack.5.weight" in sd
-        or "decoder.blocks.2.blocks.3.stack.5.weight" in sd
-        or "layers.4.layers.1.attn_block.attn.qkv.weight" in sd
-        or "encoder.layers.4.layers.1.attn_block.attn.qkv.weight" in sd
-      ):  # genmo mochi vae
-        if "blocks.2.blocks.3.stack.5.weight" in sd:
-          sd = comfy.utils.state_dict_prefix_replace(sd, {"": "decoder."})
-        if "layers.4.layers.1.attn_block.attn.qkv.weight" in sd:
-          sd = comfy.utils.state_dict_prefix_replace(sd, {"": "encoder."})
-        self.first_stage_model = comfy.ldm.genmo.vae.model.VideoVAE()
-        self.latent_channels = 12
-        self.latent_dim = 3
-        self.memory_used_decode = lambda shape, dtype: (
-          1000 * shape[2] * shape[3] * shape[4] * (6 * 8 * 8)
-        ) * model_management.dtype_size(dtype)
-        self.memory_used_encode = lambda shape, dtype: (
-          1.5 * max(shape[2], 7) * shape[3] * shape[4] * (6 * 8 * 8)
-        ) * model_management.dtype_size(dtype)
-        self.upscale_ratio = (lambda a: max(0, a * 6 - 5), 8, 8)
-        self.upscale_index_formula = (6, 8, 8)
-        self.downscale_ratio = (lambda a: max(0, math.floor((a + 5) / 6)), 8, 8)
-        self.downscale_index_formula = (6, 8, 8)
-        self.working_dtypes = [torch.float16, torch.float32]
-      elif (
-        "decoder.up_blocks.0.res_blocks.0.conv1.conv.weight" in sd
-      ):  # lightricks ltxv
-        tensor_conv1 = sd["decoder.up_blocks.0.res_blocks.0.conv1.conv.weight"]
-        version = 0
-        if tensor_conv1.shape[0] == 512:
-          version = 0
-        elif tensor_conv1.shape[0] == 1024:
-          version = 1
-          if "encoder.down_blocks.1.conv.conv.bias" in sd:
-            version = 2
-        vae_config = None
-        if metadata is not None and "config" in metadata:
-          vae_config = json.loads(metadata["config"]).get("vae", None)
-        self.first_stage_model = (
-          comfy.ldm.lightricks.vae.causal_video_autoencoder.VideoVAE(
-            version=version, config=vae_config
-          )
-        )
-        self.latent_channels = 128
-        self.latent_dim = 3
-        self.memory_used_decode = lambda shape, dtype: (
-          900 * shape[2] * shape[3] * shape[4] * (8 * 8 * 8)
-        ) * model_management.dtype_size(dtype)
-        self.memory_used_encode = lambda shape, dtype: (
-          70 * max(shape[2], 7) * shape[3] * shape[4]
-        ) * model_management.dtype_size(dtype)
-        self.upscale_ratio = (lambda a: max(0, a * 8 - 7), 32, 32)
-        self.upscale_index_formula = (8, 32, 32)
-        self.downscale_ratio = (lambda a: max(0, math.floor((a + 7) / 8)), 32, 32)
-        self.downscale_index_formula = (8, 32, 32)
-        self.working_dtypes = [torch.bfloat16, torch.float32]
-      elif (
         "decoder.conv_in.conv.weight" in sd
         and sd["decoder.conv_in.conv.weight"].shape[1] == 32
       ):
@@ -439,7 +382,7 @@ class VAE:
             "temperal_downsample": [False, True, True],
             "dropout": 0.0,
           }
-          self.first_stage_model = comfy.ldm.wan.vae2_2.WanVAE(**ddconfig)
+          self.first_stage_model = vae2_2.WanVAE(**ddconfig)
           self.working_dtypes = [torch.bfloat16, torch.float16, torch.float32]
           self.memory_used_encode = (
             lambda shape, dtype: 3300
@@ -470,7 +413,7 @@ class VAE:
             "temperal_downsample": [False, True, True],
             "dropout": 0.0,
           }
-          self.first_stage_model = comfy.ldm.wan.vae.WanVAE(**ddconfig)
+          self.first_stage_model = vae.WanVAE(**ddconfig)
           self.working_dtypes = [torch.bfloat16, torch.float16, torch.float32]
           self.memory_used_encode = (
             lambda shape, dtype: 6000
@@ -601,7 +544,7 @@ class VAE:
     self.first_stage_model.to(self.vae_dtype)
     self.output_device = model_management.intermediate_device()
 
-    self.patcher = comfy.model_patcher.ModelPatcher(
+    self.patcher = model_patcher.ModelPatcher(
       self.first_stage_model, load_device=self.device, offload_device=offload_device
     )
     logging.info(
@@ -614,7 +557,7 @@ class VAE:
   def model_size(self):
     if self.size is not None:
       return self.size
-    self.size = comfy.model_management.module_size(self.first_stage_model)
+    self.size = model_management.module_size(self.first_stage_model)
     return self.size
 
   def get_ram_usage(self):
